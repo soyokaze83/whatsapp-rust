@@ -7,6 +7,13 @@ use std::sync::Arc;
 /// WA Web: `WAWebMessageQueue` uses `promiseTimeout(r(), 2e4)` per queued handler.
 const MAX_MESSAGE_DELAY_MS: u64 = 20_000;
 
+/// Bound each per-chat mailbox so a slow handler cannot grow memory without
+/// limit. A full mailbox follows the existing ACK-cancellation path in
+/// `MessageHandler::handle`, allowing server redelivery.
+const CHAT_LANE_QUEUE_CAPACITY: usize = 256;
+
+type MessageNode = Arc<wacore_binary::OwnedNodeRef>;
+
 /// Handler for `<message>` stanzas.
 ///
 /// Messages are processed sequentially per-chat using a mailbox pattern to prevent
@@ -61,7 +68,7 @@ impl StanzaHandler for MessageHandler {
 /// Construct a ChatLane with a spawned worker task. Extracted to keep the
 /// init closure passed to `get_with_by_ref` small.
 fn create_chat_lane(client: &Arc<Client>) -> ChatLane {
-    let (tx, rx) = async_channel::unbounded::<Arc<wacore_binary::OwnedNodeRef>>();
+    let (tx, rx) = create_chat_lane_queue();
 
     let client_for_worker = client.clone();
     let spawn_generation = client
@@ -99,5 +106,39 @@ fn create_chat_lane(client: &Arc<Client>) -> ChatLane {
     ChatLane {
         enqueue_lock: Arc::new(async_lock::Mutex::new(())),
         queue_tx: tx,
+    }
+}
+
+fn create_chat_lane_queue() -> (
+    async_channel::Sender<MessageNode>,
+    async_channel::Receiver<MessageNode>,
+) {
+    async_channel::bounded(CHAT_LANE_QUEUE_CAPACITY)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wacore_binary::builder::NodeBuilder;
+
+    #[test]
+    fn per_chat_message_queue_rejects_capacity_plus_one() {
+        let (sender, _receiver) = create_chat_lane_queue();
+        for index in 0..CHAT_LANE_QUEUE_CAPACITY {
+            let node = NodeBuilder::new("message")
+                .attr("id", index.to_string())
+                .build();
+            assert!(
+                sender
+                    .try_send(crate::test_utils::node_to_owned_ref(&node))
+                    .is_ok()
+            );
+        }
+
+        let overflow = NodeBuilder::new("message").attr("id", "overflow").build();
+        assert!(matches!(
+            sender.try_send(crate::test_utils::node_to_owned_ref(&overflow)),
+            Err(async_channel::TrySendError::Full(_))
+        ));
     }
 }
