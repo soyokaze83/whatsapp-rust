@@ -1269,6 +1269,47 @@ impl Client {
         Ok(())
     }
 
+    /// Deregister this companion device only when the server confirms the
+    /// remove-device IQ, then disconnect.
+    ///
+    /// Unlike [`Self::logout`], this fails closed while offline, when the
+    /// account identity is unavailable, or when WhatsApp rejects/times out the
+    /// IQ. On failure it leaves the connection running and restores the prior
+    /// auto-reconnect policy so callers can retry. A caller may safely erase
+    /// local session credentials only after this method returns `Ok(())`.
+    pub async fn logout_strict(self: &Arc<Self>) -> Result<()> {
+        use wacore::iq::devices::RemoveCompanionDeviceSpec;
+
+        let reconnect_was_enabled = self.enable_auto_reconnect.swap(false, Ordering::Relaxed);
+        let request_result = async {
+            if !self.is_connected() {
+                return Err(anyhow!(
+                    "cannot confirm remote logout while the client is disconnected"
+                ));
+            }
+            let jid = self.require_pn().await?;
+            self.execute(RemoveCompanionDeviceSpec::new(&jid)).await?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = request_result {
+            self.enable_auto_reconnect
+                .store(reconnect_was_enabled, Ordering::Relaxed);
+            return Err(error);
+        }
+
+        self.disconnect().await;
+        self.core
+            .event_bus
+            .dispatch(Event::LoggedOut(crate::types::events::LoggedOut {
+                on_connect: false,
+                reason: ConnectFailureReason::LoggedOut,
+            }));
+
+        Ok(())
+    }
+
     pub async fn disconnect(self: &Arc<Self>) {
         info!("Disconnecting client intentionally.");
         self.expected_disconnect.store(true, Ordering::Relaxed);
@@ -6168,6 +6209,35 @@ mod tests {
             captured.is_fired(),
             "captured signal must retain the pre-reset notifier's fired state"
         );
+    }
+
+    #[tokio::test]
+    async fn strict_logout_fails_closed_without_a_confirmable_remote_request() {
+        let disconnected = crate::test_utils::create_test_client().await;
+        let reconnect_was_enabled = disconnected.enable_auto_reconnect.load(Ordering::Relaxed);
+
+        assert!(disconnected.logout_strict().await.is_err());
+        assert_eq!(
+            disconnected.enable_auto_reconnect.load(Ordering::Relaxed),
+            reconnect_was_enabled
+        );
+        assert!(!disconnected.shutdown_signal().is_fired());
+
+        let missing_identity = crate::test_utils::create_test_client().await;
+        missing_identity.is_connected.store(true, Ordering::Release);
+        let reconnect_was_enabled = missing_identity
+            .enable_auto_reconnect
+            .load(Ordering::Relaxed);
+
+        assert!(missing_identity.logout_strict().await.is_err());
+        assert_eq!(
+            missing_identity
+                .enable_auto_reconnect
+                .load(Ordering::Relaxed),
+            reconnect_was_enabled
+        );
+        assert!(missing_identity.is_connected());
+        assert!(!missing_identity.shutdown_signal().is_fired());
     }
 
     // Terminal disconnect() must also wake per-connection subscribers via
