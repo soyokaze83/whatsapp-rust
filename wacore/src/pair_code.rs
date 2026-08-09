@@ -334,9 +334,10 @@ impl PairCodeUtils {
                 NodeBuilder::new("companion_platform_display")
                     .bytes(platform_display.as_bytes().to_vec())
                     .build(),
-                // Nonce is sent as string "0" (matching whatsmeow/baileys)
+                // The protocol nonce is one zero byte, matching whatsmeow and
+                // the upstream fix in d394551, not the ASCII character "0".
                 NodeBuilder::new("link_code_pairing_nonce")
-                    .bytes(b"0".to_vec())
+                    .bytes(vec![0])
                     .build(),
             ])
             .build();
@@ -1024,8 +1025,7 @@ mod tests {
             Some("true")
         );
 
-        // Nonce is the string "0", per whatsmeow/baileys parity.
-        assert_eq!(child_bytes(reg, "link_code_pairing_nonce"), b"0");
+        assert_eq!(child_bytes(reg, "link_code_pairing_nonce"), &[0]);
     }
 
     #[test]
