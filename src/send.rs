@@ -201,6 +201,34 @@ fn build_revoke_message(
     }
 }
 
+fn dm_stanza_destination(requested: &Jid, recipient_bare: &Jid) -> Jid {
+    if recipient_bare.is_lid() {
+        recipient_bare.clone()
+    } else {
+        requested.clone()
+    }
+}
+
+fn align_own_dm_devices(
+    devices: &mut [Jid],
+    recipient_is_lid: bool,
+    own_jid: &Jid,
+    own_lid: Option<&Jid>,
+) -> Result<(), anyhow::Error> {
+    if !recipient_is_lid {
+        return Ok(());
+    }
+
+    let own_lid = own_lid
+        .ok_or_else(|| anyhow!("cannot send a LID-addressed DM before the device LID is known"))?;
+    for device in devices {
+        if device.is_pn() && device.is_same_user_as(own_jid) {
+            *device = Jid::lid_device(own_lid.user.clone(), device.device);
+        }
+    }
+    Ok(())
+}
+
 impl Client {
     /// Send a message to a user, group, or newsletter.
     ///
@@ -1171,6 +1199,8 @@ impl Client {
             // WAWebSendUserMsgJob reads local device table only on the send
             // path; WAWebDBDeviceListFanout excludes hosted devices.
             let recipient_bare = self.resolve_encryption_jid(&to).await.to_non_ad();
+            let recipient_is_lid = recipient_bare.is_lid();
+            let stanza_to = dm_stanza_destination(&to, &recipient_bare);
 
             // Local registry first; network warm only on miss to avoid
             // unnecessary LID-migration side effects from get_user_devices
@@ -1209,6 +1239,9 @@ impl Client {
                     || own_lid.is_some_and(|lid| j.is_same_user_as(lid) && j.device == lid.device);
                 !is_sender
             });
+
+            // WhatsApp rejects mixed PN/LID participant namespaces as a malformed stanza.
+            align_own_dm_devices(&mut all_dm_jids, recipient_is_lid, own_jid, own_lid)?;
 
             // Dedup for self-DMs: recipient and own device lists overlap when
             // sending to own account. `participant_list_hash` sorts internally,
@@ -1251,7 +1284,7 @@ impl Client {
                 own_jid,
                 device_snapshot.lid.as_ref(),
                 device_snapshot.account.as_ref(),
-                to,
+                stanza_to,
                 message,
                 request_id,
                 edit,
@@ -2565,6 +2598,197 @@ mod tests {
             };
             let node = infer_biz_node(&msg).unwrap();
             assert_biz_node(&node, "cta_url");
+        }
+    }
+
+    mod dm_lid_regression {
+        use super::*;
+        use wacore::libsignal::protocol::{
+            IdentityKeyPair, KeyPair, PreKeyBundle, SignalProtocolError, UsePQRatchet,
+            process_prekey_bundle,
+        };
+
+        #[test]
+        fn lid_destination_aligns_own_companions_to_the_lid_namespace() {
+            let requested = Jid::pn("15550000001");
+            let peer_lid = Jid::lid("100000000000001");
+            let own_pn = Jid::pn("15550000002");
+            let own_lid = Jid::lid("100000000000002");
+            let mut devices = vec![
+                Jid::lid_device(peer_lid.user.clone(), 0),
+                Jid::pn_device(own_pn.user.clone(), 7),
+            ];
+
+            assert_eq!(dm_stanza_destination(&requested, &peer_lid), peer_lid);
+            align_own_dm_devices(&mut devices, true, &own_pn, Some(&own_lid))
+                .expect("own LID should permit namespace alignment");
+
+            assert!(devices.iter().all(Jid::is_lid));
+            assert_eq!(devices[1], Jid::lid_device(own_lid.user, 7));
+        }
+
+        #[test]
+        fn pn_destination_needs_no_own_lid_and_stays_in_the_pn_namespace() {
+            let requested = Jid::pn("15550000001");
+            let recipient = Jid::pn("15550000001");
+            let own_pn = Jid::pn("15550000002");
+            let mut devices = vec![Jid::pn_device(own_pn.user.clone(), 7)];
+
+            assert_eq!(dm_stanza_destination(&requested, &recipient), requested);
+            align_own_dm_devices(&mut devices, false, &own_pn, None)
+                .expect("PN fanout should not require an own LID");
+            assert_eq!(devices, vec![Jid::pn_device(own_pn.user, 7)]);
+        }
+
+        #[test]
+        fn lid_destination_without_an_own_lid_is_rejected() {
+            let own_pn = Jid::pn("15550000002");
+            let mut devices = vec![Jid::pn_device(own_pn.user.clone(), 7)];
+
+            let error = align_own_dm_devices(&mut devices, true, &own_pn, None)
+                .expect_err("LID fanout cannot mix in PN-addressed own devices");
+            assert_eq!(
+                error.to_string(),
+                "cannot send a LID-addressed DM before the device LID is known"
+            );
+        }
+
+        async fn seed_signal_session(
+            client: &Client,
+            recipient: &Jid,
+        ) -> Result<(), SignalProtocolError> {
+            let bundle = tokio::task::spawn_blocking(|| {
+                let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+                let receiver = IdentityKeyPair::generate(&mut rng);
+                let signed_pre_key = KeyPair::generate(&mut rng);
+                let one_time_pre_key = KeyPair::generate(&mut rng);
+                let signature = receiver
+                    .private_key()
+                    .calculate_signature(&signed_pre_key.public_key.serialize(), &mut rng)?;
+                PreKeyBundle::new(
+                    1,
+                    1u32.into(),
+                    Some((1u32.into(), one_time_pre_key.public_key)),
+                    1u32.into(),
+                    signed_pre_key.public_key,
+                    signature.to_vec(),
+                    *receiver.identity_key(),
+                )
+            })
+            .await
+            .expect("pre-key fixture task should complete")?;
+
+            let mut adapter = client.signal_adapter().await;
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            process_prekey_bundle(
+                &recipient.to_non_ad().to_protocol_address(),
+                &mut adapter.session_store,
+                &mut adapter.identity_store,
+                &bundle,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn lid_mapped_dm_uses_one_lid_namespace_for_the_wire_stanza() {
+            let client = crate::test_utils::create_test_client_with_name("lid_dm_wire").await;
+            let own_pn = Jid::pn("15550000002");
+            let own_lid = Jid::lid("100000000000002");
+            let peer_pn = Jid::pn("15550000001");
+            let peer_lid = Jid::lid("100000000000001");
+
+            client
+                .persistence_manager
+                .process_command(crate::store::commands::DeviceCommand::SetId(Some(
+                    own_pn.clone(),
+                )))
+                .await;
+            client
+                .persistence_manager
+                .process_command(crate::store::commands::DeviceCommand::SetLid(Some(own_lid)))
+                .await;
+            client
+                .persistence_manager
+                .process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+                    wa::AdvSignedDeviceIdentity::default(),
+                )))
+                .await;
+            client
+                .add_lid_pn_mapping(
+                    &peer_lid.user,
+                    &peer_pn.user,
+                    crate::lid_pn_cache::LearningSource::Usync,
+                )
+                .await
+                .expect("peer LID mapping should persist");
+
+            for jid in [&peer_lid, &own_pn] {
+                client
+                    .update_device_list(wacore::store::traits::DeviceListRecord {
+                        user: jid.user.to_string(),
+                        devices: vec![wacore::store::traits::DeviceInfo {
+                            device_id: 0,
+                            key_index: None,
+                        }],
+                        timestamp: wacore::time::now_secs(),
+                        phash: None,
+                        raw_id: None,
+                    })
+                    .await
+                    .expect("device-list fixture should persist");
+            }
+            client.complete_offline_sync(0);
+            seed_signal_session(&client, &peer_lid)
+                .await
+                .expect("peer LID session should initialize");
+
+            let request_id = "LID_DM_WIRE_1";
+            let waiter = client.wait_for_sent_node(
+                crate::client::NodeFilter::tag("message").attr("id", request_id),
+            );
+            let message = wa::Message {
+                conversation: Some("probe".into()),
+                ..Default::default()
+            };
+            let result = client
+                .send_message_impl(
+                    peer_pn,
+                    &message,
+                    Some(request_id.to_string()),
+                    false,
+                    false,
+                    None,
+                    vec![],
+                )
+                .await;
+            assert!(result.is_err(), "offline test client should not send");
+
+            let node = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .expect("sent stanza should be captured before timeout")
+                .expect("sent stanza waiter should resolve");
+            let wire_destination = node
+                .attrs()
+                .optional_jid("to")
+                .expect("message stanza should have a destination");
+            assert_eq!(wire_destination, peer_lid);
+
+            let participants = node
+                .get_optional_child("participants")
+                .expect("DM stanza should have participants");
+            let entries = participants
+                .children()
+                .expect("participants should contain encrypted targets");
+            assert!(!entries.is_empty());
+            for entry in entries {
+                let participant = entry
+                    .attrs()
+                    .optional_jid("jid")
+                    .expect("encrypted target should have a JID");
+                assert!(participant.is_lid());
+            }
         }
     }
 
