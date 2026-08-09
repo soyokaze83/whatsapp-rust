@@ -55,13 +55,22 @@ impl StanzaHandler for MessageHandler {
         // Lock serializes enqueue order for this chat
         let _guard = lane.enqueue_lock.lock().await;
 
-        if let Err(e) = lane.queue_tx.try_send(node) {
-            warn!("Failed to enqueue message for processing: {e}");
-            // Cancel ack so server redelivers
-            *cancelled = true;
-        }
+        enqueue_or_cancel_ack(&lane.queue_tx, node, cancelled);
 
         true
+    }
+}
+
+fn enqueue_or_cancel_ack(
+    sender: &async_channel::Sender<MessageNode>,
+    node: MessageNode,
+    cancelled: &mut bool,
+) {
+    if let Err(error) = sender.try_send(node) {
+        warn!("Failed to enqueue message for processing: {error}");
+        // The client router observes this flag and withholds its deferred ACK,
+        // allowing the server to redeliver a stanza that was not accepted.
+        *cancelled = true;
     }
 }
 
@@ -124,7 +133,16 @@ mod tests {
     #[test]
     fn per_chat_message_queue_rejects_capacity_plus_one() {
         let (sender, _receiver) = create_chat_lane_queue();
-        for index in 0..CHAT_LANE_QUEUE_CAPACITY {
+        let mut cancelled = false;
+        let first = NodeBuilder::new("message").attr("id", "0").build();
+        enqueue_or_cancel_ack(
+            &sender,
+            crate::test_utils::node_to_owned_ref(&first),
+            &mut cancelled,
+        );
+        assert!(!cancelled, "an accepted stanza must remain ACK-eligible");
+
+        for index in 1..CHAT_LANE_QUEUE_CAPACITY {
             let node = NodeBuilder::new("message")
                 .attr("id", index.to_string())
                 .build();
@@ -136,9 +154,14 @@ mod tests {
         }
 
         let overflow = NodeBuilder::new("message").attr("id", "overflow").build();
-        assert!(matches!(
-            sender.try_send(crate::test_utils::node_to_owned_ref(&overflow)),
-            Err(async_channel::TrySendError::Full(_))
-        ));
+        enqueue_or_cancel_ack(
+            &sender,
+            crate::test_utils::node_to_owned_ref(&overflow),
+            &mut cancelled,
+        );
+        assert!(
+            cancelled,
+            "a saturated lane must cancel the deferred ACK for redelivery"
+        );
     }
 }
