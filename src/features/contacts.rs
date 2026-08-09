@@ -25,10 +25,7 @@ impl<'a> Contacts<'a> {
         Self { client }
     }
 
-    async fn persist_lid_mappings<'b, I>(&self, entries: I)
-    where
-        I: IntoIterator<Item = (&'b Jid, Option<&'b Jid>)>,
-    {
+    async fn persist_lid_mappings(&self, entries: Vec<(Jid, Option<Jid>)>) {
         for (jid, lid) in entries {
             let Some(lid) = lid else {
                 continue;
@@ -99,16 +96,25 @@ impl<'a> Contacts<'a> {
             results.extend(self.client.execute(spec).await?);
         }
 
-        self.persist_lid_mappings(results.iter().map(|r| (&r.jid, r.lid.as_ref())))
-            .await;
-        self.persist_lid_mappings(results.iter().filter_map(|r| {
-            if r.jid.is_lid() {
-                r.pn_jid.as_ref().map(|pn| (pn, Some(&r.jid)))
-            } else {
-                None
-            }
-        }))
-        .await;
+        let pn_mappings = results
+            .iter()
+            .map(|result| (result.jid.clone(), result.lid.clone()))
+            .collect();
+        self.persist_lid_mappings(pn_mappings).await;
+        let lid_mappings = results
+            .iter()
+            .filter_map(|result| {
+                if result.jid.is_lid() {
+                    result
+                        .pn_jid
+                        .clone()
+                        .map(|phone| (phone, Some(result.jid.clone())))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        self.persist_lid_mappings(lid_mappings).await;
 
         Ok(results)
     }
@@ -179,8 +185,11 @@ impl<'a> Contacts<'a> {
         let spec = UserInfoSpec::new(jids.to_vec(), request_id);
 
         let info = self.client.execute(spec).await?;
-        self.persist_lid_mappings(info.values().map(|entry| (&entry.jid, entry.lid.as_ref())))
-            .await;
+        let mappings = info
+            .values()
+            .map(|entry| (entry.jid.clone(), entry.lid.clone()))
+            .collect();
+        self.persist_lid_mappings(mappings).await;
         Ok(info)
     }
 }
@@ -194,6 +203,16 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_on_whatsapp_future_is_send() {
+        fn check(contacts: &Contacts<'_>, jids: &[Jid]) {
+            fn assert_send<T: Send>(_: T) {}
+            assert_send(contacts.is_on_whatsapp(jids));
+        }
+
+        let _ = check;
+    }
 
     #[test]
     fn test_profile_picture_struct() {
