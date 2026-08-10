@@ -1323,9 +1323,7 @@ impl Client {
             .await;
         }
 
-        if let Some(protocol_msg) = &msg.protocol_message
-            && let Some(keys) = &protocol_msg.app_state_sync_key_share
-        {
+        if let Some(keys) = companion_app_state_key_share(&msg, info) {
             self.handle_app_state_sync_key_share(keys).await;
         }
 
@@ -1337,11 +1335,7 @@ impl Client {
             self.handle_pdo_response(pdo_response, info).await;
         }
 
-        // Note: msg might be modified by take() below
-        let history_sync_taken = msg
-            .protocol_message
-            .as_mut()
-            .and_then(|pm| pm.history_sync_notification.take());
+        let history_sync_taken = take_companion_history_sync(&mut msg, info);
 
         if let Some(history_sync) = history_sync_taken {
             self.handle_history_sync(info.id.clone(), history_sync)
@@ -1676,6 +1670,34 @@ impl Client {
     }
 }
 
+fn accepts_companion_protocol_state(info: &MessageInfo) -> bool {
+    info.source.is_from_me
+}
+
+fn companion_app_state_key_share<'a>(
+    msg: &'a wa::Message,
+    info: &MessageInfo,
+) -> Option<&'a wa::message::AppStateSyncKeyShare> {
+    if !accepts_companion_protocol_state(info) {
+        return None;
+    }
+    msg.protocol_message
+        .as_deref()
+        .and_then(|protocol| protocol.app_state_sync_key_share.as_ref())
+}
+
+fn take_companion_history_sync(
+    msg: &mut wa::Message,
+    info: &MessageInfo,
+) -> Option<wa::message::HistorySyncNotification> {
+    if !accepts_companion_protocol_state(info) {
+        return None;
+    }
+    msg.protocol_message
+        .as_deref_mut()
+        .and_then(|protocol| protocol.history_sync_notification.take())
+}
+
 /// Unwraps a `DeviceSentMessage` wrapper, returning the inner message with
 /// merged `message_context_info`.
 ///
@@ -1712,6 +1734,35 @@ mod tests {
         crate::test_utils::node_to_owned_ref(&node)
     }
     use wacore_binary::{Jid, SERVER_JID};
+
+    #[test]
+    fn companion_protocol_state_requires_own_account_origin() {
+        let mut message = wa::Message {
+            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
+                app_state_sync_key_share: Some(Default::default()),
+                history_sync_notification: Some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let peer_info = MessageInfo::default();
+
+        assert!(companion_app_state_key_share(&message, &peer_info).is_none());
+        assert!(take_companion_history_sync(&mut message, &peer_info).is_none());
+        assert!(
+            message
+                .protocol_message
+                .as_ref()
+                .and_then(|protocol| protocol.history_sync_notification.as_ref())
+                .is_some(),
+            "rejected peer state must not be consumed"
+        );
+
+        let mut own_info = MessageInfo::default();
+        own_info.source.is_from_me = true;
+        assert!(companion_app_state_key_share(&message, &own_info).is_some());
+        assert!(take_companion_history_sync(&mut message, &own_info).is_some());
+    }
 
     fn mock_transport() -> Arc<dyn crate::transport::TransportFactory> {
         Arc::new(crate::transport::mock::MockTransportFactory::new())

@@ -268,6 +268,7 @@ impl DownloadUtils {
         let direct_path = downloadable
             .direct_path()
             .ok_or_else(|| anyhow!("Missing direct_path"))?;
+        validate_direct_path(direct_path)?;
 
         // Encrypted media uses file_enc_sha256 as URL token,
         // unencrypted (newsletter) uses file_sha256 instead.
@@ -539,6 +540,26 @@ impl DownloadUtils {
     }
 }
 
+const MAX_DIRECT_PATH_BYTES: usize = 4096;
+
+fn validate_direct_path(path: &str) -> Result<()> {
+    let bytes = path.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > MAX_DIRECT_PATH_BYTES
+        || bytes.first() != Some(&b'/')
+        || bytes.get(1) == Some(&b'/')
+        || !path.is_ascii()
+        || bytes
+            .iter()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || bytes.contains(&b'\\')
+        || bytes.contains(&b'#')
+    {
+        return Err(anyhow!("Invalid direct_path"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +686,49 @@ mod tests {
         };
         let err = DownloadUtils::prepare_download_requests(&d, &mock_media_conn()).unwrap_err();
         assert!(err.to_string().contains("Missing direct_path"));
+    }
+
+    #[test]
+    fn prepare_requests_rejects_unsafe_direct_paths() {
+        for direct_path in [
+            "@attacker.example/blob",
+            "//attacker.example/blob",
+            "/safe\\@attacker.example/blob",
+            "/safe#fragment",
+            "/safe\r\nHost: attacker.example",
+            "/non-ascii-é",
+        ] {
+            let d = MockDownloadable {
+                direct_path: Some(direct_path.into()),
+                static_url: None,
+                media_key: Some(vec![1; 32]),
+                file_sha256: Some(vec![2; 32]),
+                file_enc_sha256: Some(vec![3; 32]),
+                media_type: MediaType::History,
+            };
+            let error = DownloadUtils::prepare_download_requests(&d, &mock_media_conn())
+                .expect_err("unsafe direct path must be rejected");
+            assert!(error.to_string().contains("Invalid direct_path"));
+        }
+    }
+
+    #[test]
+    fn prepare_requests_accepts_relative_path_with_query() {
+        let d = MockDownloadable {
+            direct_path: Some("/v/t1/media.enc?part=1".into()),
+            static_url: None,
+            media_key: Some(vec![1; 32]),
+            file_sha256: Some(vec![2; 32]),
+            file_enc_sha256: Some(vec![3; 32]),
+            media_type: MediaType::History,
+        };
+        let requests = DownloadUtils::prepare_download_requests(&d, &mock_media_conn())
+            .expect("valid relative direct path");
+        assert!(
+            requests[0]
+                .url
+                .starts_with("https://cdn1.example.com/v/t1/media.enc?part=1")
+        );
     }
 
     #[test]
