@@ -43,14 +43,14 @@ impl FlushScope {
     /// Spawn a tracked task. The counter decrements on completion OR if the
     /// future is dropped (e.g. aborted, or dropped before its first poll), so
     /// `flush` can never deadlock waiting on a cancelled task.
-    pub fn spawn<F>(self: &Arc<Self>, rt: &dyn Runtime, fut: F)
+    pub fn spawn<F>(self: &Arc<Self>, rt: &dyn Runtime, fut: F) -> bool
     where
         F: Future<Output = ()> + Send + 'static,
     {
         {
             let closed = self.closed.lock().unwrap_or_else(|e| e.into_inner());
             if *closed {
-                return;
+                return false;
             }
             self.count.fetch_add(1, Ordering::Relaxed);
         }
@@ -69,6 +69,23 @@ impl FlushScope {
             fut.await;
         }))
         .detach();
+        true
+    }
+
+    /// Wait until every tracked task has finished without imposing a timeout.
+    ///
+    /// Callers must arrange their own outer lifecycle deadline. This is used by
+    /// inbound-message quiescence, where timing out inside the dependency would
+    /// make it impossible for the application to distinguish durable admission
+    /// from work that must remain eligible for server redelivery.
+    pub async fn wait_idle(&self) {
+        loop {
+            let listener = self.idle.listen();
+            if self.count.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            listener.await;
+        }
     }
 
     /// Wait until every tracked task has finished or the timeout elapses.

@@ -149,6 +149,40 @@ type ChatStateHandler = Arc<dyn Fn(ChatStateEvent) + Send + Sync>;
 pub(crate) struct ChatLane {
     pub enqueue_lock: Arc<async_lock::Mutex<()>>,
     pub queue_tx: async_channel::Sender<Arc<wacore_binary::OwnedNodeRef>>,
+    pub worker_started: bool,
+}
+
+struct PendingInboundCommit {
+    committed: AtomicBool,
+    changed: event_listener::Event,
+    info: Arc<wacore::types::message::MessageInfo>,
+    send_delivery_receipt: bool,
+}
+
+impl PendingInboundCommit {
+    fn new(info: Arc<wacore::types::message::MessageInfo>, send_delivery_receipt: bool) -> Self {
+        Self {
+            committed: AtomicBool::new(false),
+            changed: event_listener::Event::new(),
+            info,
+            send_delivery_receipt,
+        }
+    }
+
+    fn mark_committed(&self) {
+        self.committed.store(true, Ordering::Release);
+        self.changed.notify(usize::MAX);
+    }
+
+    async fn wait_committed(&self) {
+        loop {
+            let listener = self.changed.listen();
+            if self.committed.load(Ordering::Acquire) {
+                return;
+            }
+            listener.await;
+        }
+    }
 }
 
 const APP_STATE_RETRY_MAX_ATTEMPTS: u32 = 6;
@@ -382,6 +416,14 @@ pub struct Client {
     /// Per-chat lane combining enqueue lock + message queue into a single cached entry.
     /// One cache lookup instead of two per incoming message.
     pub(crate) chat_lanes: Cache<Jid, ChatLane>,
+
+    /// Terminal product shutdown closes this gate before draining all accepted
+    /// per-chat work. New stanzas then retain server-redelivery eligibility.
+    pub(crate) accepting_inbound_messages: AtomicBool,
+    /// Tracks every accepted per-chat worker through downstream durable commit.
+    pub(crate) inbound_message_flush: Arc<crate::flush_scope::FlushScope>,
+    /// Commit barriers keyed by the stable WhatsApp message identifier.
+    pending_inbound_commits: std::sync::Mutex<HashMap<String, Arc<PendingInboundCommit>>>,
 
     /// Cache for LID to Phone Number mappings (bidirectional).
     /// When we receive a message with sender_lid/sender_pn attributes, we store the mapping here.
@@ -774,6 +816,9 @@ impl Client {
             chat_lanes: Cache::builder()
                 .max_capacity(cache_config.chat_lanes_capacity.max(1))
                 .build(),
+            accepting_inbound_messages: AtomicBool::new(true),
+            inbound_message_flush: Arc::new(crate::flush_scope::FlushScope::new()),
+            pending_inbound_commits: std::sync::Mutex::new(HashMap::new()),
             lid_pn_cache: Arc::new(LidPnCache::with_config(
                 &cache_config.lid_pn_cache,
                 cache_config.cache_stores.lid_pn_cache.clone(),
@@ -1267,6 +1312,93 @@ impl Client {
             }));
 
         Ok(())
+    }
+
+    /// Registers a message event whose transport acknowledgement must wait for
+    /// downstream durable admission.
+    pub(crate) fn register_inbound_commit(
+        &self,
+        info: Arc<wacore::types::message::MessageInfo>,
+        send_delivery_receipt: bool,
+    ) {
+        let mut pending = self
+            .pending_inbound_commits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending
+            .entry(info.id.clone())
+            .or_insert_with(|| Arc::new(PendingInboundCommit::new(info, send_delivery_receipt)));
+    }
+
+    /// Confirms that the application durably owns one inbound message.
+    ///
+    /// Returns `false` when no matching dependency event is awaiting commit.
+    /// A `true` result releases the per-chat worker to send the delivery
+    /// receipt and deferred stanza acknowledgement.
+    pub fn acknowledge_inbound_message(&self, message_id: &str) -> bool {
+        let pending = self
+            .pending_inbound_commits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(message_id)
+            .cloned();
+        let Some(pending) = pending else {
+            return false;
+        };
+        pending.mark_committed();
+        true
+    }
+
+    /// Stops accepting message stanzas and closes every cached per-chat lane.
+    /// Already accepted workers continue until downstream durable admission.
+    pub async fn begin_inbound_quiesce(&self) {
+        self.accepting_inbound_messages
+            .store(false, Ordering::Release);
+        self.inbound_message_flush.close();
+        self.chat_lanes.invalidate_all();
+        self.chat_lanes.run_pending_tasks().await;
+    }
+
+    /// Waits until every message accepted before quiescence has either reached
+    /// downstream durable admission or remained unacknowledged for redelivery.
+    pub async fn wait_for_inbound_quiescence(&self) {
+        self.inbound_message_flush.wait_idle().await;
+    }
+
+    pub(crate) async fn finish_incoming_message(
+        self: &Arc<Self>,
+        node: Arc<wacore_binary::OwnedNodeRef>,
+    ) {
+        let message_id = node
+            .get()
+            .get_attr("id")
+            .map(|value| value.as_str().into_owned());
+        let pending = message_id.as_ref().and_then(|message_id| {
+            self.pending_inbound_commits
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(message_id)
+                .cloned()
+        });
+        if let Some(pending) = pending {
+            pending.wait_committed().await;
+            if pending.send_delivery_receipt {
+                self.send_delivery_receipt(&pending.info).await;
+            }
+            if let Some(message_id) = message_id {
+                let mut commits = self
+                    .pending_inbound_commits
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if commits
+                    .get(&message_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &pending))
+                {
+                    commits.remove(&message_id);
+                }
+            }
+        }
+        self.maybe_deferred_ack(node).await;
     }
 
     /// Deregister this companion device only when the server confirms the

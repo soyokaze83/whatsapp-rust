@@ -75,7 +75,7 @@ const HIGH_RETRY_COUNT_THRESHOLD: u8 = 3;
 pub(crate) use wacore::protocol::retry::RetryReason;
 
 impl Client {
-    /// Dispatches a successfully parsed message to the event bus and sends a delivery receipt.
+    /// Dispatches a successfully parsed message behind a durable-commit barrier.
     fn dispatch_parsed_message(self: &Arc<Self>, msg: wa::Message, info: &Arc<MessageInfo>) {
         use wacore::proto_helpers::MessageExt;
 
@@ -87,12 +87,7 @@ impl Client {
                 msg.get_base_message().get_ephemeral_expiration();
         }
 
-        // Tracked so `disconnect()` can flush in-flight receipts (issue #571).
-        let client_clone = self.clone();
-        let info_for_receipt = Arc::clone(&info);
-        self.outbound_flush.spawn(&*self.runtime, async move {
-            client_clone.send_delivery_receipt(&info_for_receipt).await;
-        });
+        self.register_inbound_commit(Arc::clone(&info), true);
 
         self.core
             .event_bus
@@ -162,6 +157,7 @@ impl Client {
             .await;
         let was_fresh = fresh.load(std::sync::atomic::Ordering::Acquire);
         if was_fresh {
+            self.register_inbound_commit(Arc::clone(&info), false);
             self.core.event_bus.dispatch(Event::UndecryptableMessage(
                 crate::types::events::UndecryptableMessage {
                     info,

@@ -3,6 +3,7 @@ use crate::client::{ChatLane, Client};
 use async_trait::async_trait;
 use log::warn;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 /// WA Web: `WAWebMessageQueue` uses `promiseTimeout(r(), 2e4)` per queued handler.
 const MAX_MESSAGE_DELAY_MS: u64 = 20_000;
@@ -35,6 +36,10 @@ impl StanzaHandler for MessageHandler {
         node: Arc<wacore_binary::OwnedNodeRef>,
         cancelled: &mut bool,
     ) -> bool {
+        if !client.accepting_inbound_messages.load(Ordering::Acquire) {
+            *cancelled = true;
+            return true;
+        }
         let chat_jid = match node.attrs().optional_jid("from") {
             // Normalize AD metadata so the same chat always maps to one lane
             Some(jid) if jid.device > 0 || jid.agent > 0 => jid.to_non_ad(),
@@ -55,22 +60,27 @@ impl StanzaHandler for MessageHandler {
         // Lock serializes enqueue order for this chat
         let _guard = lane.enqueue_lock.lock().await;
 
-        enqueue_or_cancel_ack(&lane.queue_tx, node, cancelled);
+        if lane.worker_started {
+            enqueue_without_ack(&lane.queue_tx, node, cancelled);
+        } else {
+            *cancelled = true;
+        }
 
         true
     }
 }
 
-fn enqueue_or_cancel_ack(
+fn enqueue_without_ack(
     sender: &async_channel::Sender<MessageNode>,
     node: MessageNode,
     cancelled: &mut bool,
 ) {
+    // Message stanzas are acknowledged by the lane worker only after the
+    // downstream application confirms durable admission. A full lane also
+    // withholds the ACK so the server can redeliver the unaccepted stanza.
+    *cancelled = true;
     if let Err(error) = sender.try_send(node) {
         warn!("Failed to enqueue message for processing: {error}");
-        // The client router observes this flag and withholds its deferred ACK,
-        // allowing the server to redeliver a stanza that was not accepted.
-        *cancelled = true;
     }
 }
 
@@ -84,9 +94,9 @@ fn create_chat_lane(client: &Arc<Client>) -> ChatLane {
         .connection_generation
         .load(std::sync::atomic::Ordering::Acquire);
 
-    client
-        .runtime
-        .spawn(Box::pin(async move {
+    let worker_started = client.inbound_message_flush.spawn(
+        &*client.runtime,
+        async move {
             while let Ok(msg_node) = rx.recv().await {
                 if client_for_worker
                     .connection_generation
@@ -98,7 +108,8 @@ fn create_chat_lane(client: &Arc<Client>) -> ChatLane {
                 }
                 let start = wacore::time::Instant::now();
                 let client = client_for_worker.clone();
-                Box::pin(client.handle_incoming_message(msg_node)).await;
+                Box::pin(Arc::clone(&client).handle_incoming_message(Arc::clone(&msg_node))).await;
+                client.finish_incoming_message(msg_node).await;
                 let elapsed = start.elapsed();
                 if elapsed.as_millis() as u64 > MAX_MESSAGE_DELAY_MS {
                     warn!(
@@ -109,12 +120,13 @@ fn create_chat_lane(client: &Arc<Client>) -> ChatLane {
                     );
                 }
             }
-        }))
-        .detach();
+        },
+    );
 
     ChatLane {
         enqueue_lock: Arc::new(async_lock::Mutex::new(())),
         queue_tx: tx,
+        worker_started,
     }
 }
 
@@ -135,12 +147,15 @@ mod tests {
         let (sender, _receiver) = create_chat_lane_queue();
         let mut cancelled = false;
         let first = NodeBuilder::new("message").attr("id", "0").build();
-        enqueue_or_cancel_ack(
+        enqueue_without_ack(
             &sender,
             crate::test_utils::node_to_owned_ref(&first),
             &mut cancelled,
         );
-        assert!(!cancelled, "an accepted stanza must remain ACK-eligible");
+        assert!(
+            cancelled,
+            "an accepted stanza must wait for downstream durable admission"
+        );
 
         for index in 1..CHAT_LANE_QUEUE_CAPACITY {
             let node = NodeBuilder::new("message")
@@ -154,7 +169,8 @@ mod tests {
         }
 
         let overflow = NodeBuilder::new("message").attr("id", "overflow").build();
-        enqueue_or_cancel_ack(
+        cancelled = false;
+        enqueue_without_ack(
             &sender,
             crate::test_utils::node_to_owned_ref(&overflow),
             &mut cancelled,
