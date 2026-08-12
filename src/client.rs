@@ -37,7 +37,7 @@ use wacore_binary::Jid;
 
 use portable_atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 /// Filter for matching incoming stanzas (nodes) by tag and attributes.
 ///
@@ -153,34 +153,75 @@ pub(crate) struct ChatLane {
 }
 
 struct PendingInboundCommit {
-    committed: AtomicBool,
+    state: AtomicU8,
     changed: event_listener::Event,
     info: Arc<wacore::types::message::MessageInfo>,
     send_delivery_receipt: bool,
 }
 
+const INBOUND_COMMIT_PENDING: u8 = 0;
+const INBOUND_COMMIT_COMMITTED: u8 = 1;
+const INBOUND_COMMIT_ABANDONED: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InboundCommitOutcome {
+    Committed,
+    Abandoned,
+}
+
 impl PendingInboundCommit {
     fn new(info: Arc<wacore::types::message::MessageInfo>, send_delivery_receipt: bool) -> Self {
         Self {
-            committed: AtomicBool::new(false),
+            state: AtomicU8::new(INBOUND_COMMIT_PENDING),
             changed: event_listener::Event::new(),
             info,
             send_delivery_receipt,
         }
     }
 
-    fn mark_committed(&self) {
-        self.committed.store(true, Ordering::Release);
-        self.changed.notify(usize::MAX);
+    fn mark_committed(&self) -> bool {
+        match self.state.compare_exchange(
+            INBOUND_COMMIT_PENDING,
+            INBOUND_COMMIT_COMMITTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.changed.notify(usize::MAX);
+                true
+            }
+            Err(INBOUND_COMMIT_COMMITTED) => true,
+            Err(_) => false,
+        }
     }
 
-    async fn wait_committed(&self) {
+    fn abandon(&self) {
+        if self
+            .state
+            .compare_exchange(
+                INBOUND_COMMIT_PENDING,
+                INBOUND_COMMIT_ABANDONED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.changed.notify(usize::MAX);
+        }
+    }
+
+    fn is_abandoned(&self) -> bool {
+        self.state.load(Ordering::Acquire) == INBOUND_COMMIT_ABANDONED
+    }
+
+    async fn wait_outcome(&self) -> InboundCommitOutcome {
         loop {
             let listener = self.changed.listen();
-            if self.committed.load(Ordering::Acquire) {
-                return;
+            match self.state.load(Ordering::Acquire) {
+                INBOUND_COMMIT_COMMITTED => return InboundCommitOutcome::Committed,
+                INBOUND_COMMIT_ABANDONED => return InboundCommitOutcome::Abandoned,
+                _ => listener.await,
             }
-            listener.await;
         }
     }
 }
@@ -318,7 +359,7 @@ impl ClientError {
     }
 }
 
-use wacore::types::message::ChatMessageId;
+use wacore::types::message::{ChatMessageId, InboundMessageKey};
 
 /// Metrics for tracking offline sync progress
 #[derive(Debug)]
@@ -422,8 +463,9 @@ pub struct Client {
     pub(crate) accepting_inbound_messages: AtomicBool,
     /// Tracks every accepted per-chat worker through downstream durable commit.
     pub(crate) inbound_message_flush: Arc<crate::flush_scope::FlushScope>,
-    /// Commit barriers keyed by the stable WhatsApp message identifier.
-    pending_inbound_commits: std::sync::Mutex<HashMap<String, Arc<PendingInboundCommit>>>,
+    /// Commit barriers keyed by chat, sender, and peer-selected message ID.
+    pending_inbound_commits:
+        std::sync::Mutex<HashMap<InboundMessageKey, Arc<PendingInboundCommit>>>,
 
     /// Cache for LID to Phone Number mappings (bidirectional).
     /// When we receive a message with sender_lid/sender_pn attributes, we store the mapping here.
@@ -1325,9 +1367,22 @@ impl Client {
             .pending_inbound_commits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pending
-            .entry(info.id.clone())
-            .or_insert_with(|| Arc::new(PendingInboundCommit::new(info, send_delivery_receipt)));
+        match pending.entry(info.inbound_message_key()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().is_abandoned() {
+                    entry.insert(Arc::new(PendingInboundCommit::new(
+                        info,
+                        send_delivery_receipt,
+                    )));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Arc::new(PendingInboundCommit::new(
+                    info,
+                    send_delivery_receipt,
+                )));
+            }
+        }
     }
 
     /// Confirms that the application durably owns one inbound message.
@@ -1335,18 +1390,31 @@ impl Client {
     /// Returns `false` when no matching dependency event is awaiting commit.
     /// A `true` result releases the per-chat worker to send the delivery
     /// receipt and deferred stanza acknowledgement.
-    pub fn acknowledge_inbound_message(&self, message_id: &str) -> bool {
+    pub fn acknowledge_inbound_message(&self, key: &InboundMessageKey) -> bool {
         let pending = self
             .pending_inbound_commits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(message_id)
+            .get(key)
             .cloned();
         let Some(pending) = pending else {
             return false;
         };
-        pending.mark_committed();
-        true
+        pending.mark_committed()
+    }
+
+    /// Abandons all uncommitted inbound deliveries without acknowledging them.
+    ///
+    /// Connection recovery uses this after downstream queue overflow so the
+    /// server remains responsible for redelivery on the next connection.
+    pub fn abandon_inbound_messages(&self) {
+        let pending = self
+            .pending_inbound_commits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for commit in pending.values() {
+            commit.abandon();
+        }
     }
 
     /// Stops accepting message stanzas and closes every cached per-chat lane.
@@ -1369,36 +1437,44 @@ impl Client {
         self: &Arc<Self>,
         node: Arc<wacore_binary::OwnedNodeRef>,
     ) {
-        let message_id = node
-            .get()
-            .get_attr("id")
-            .map(|value| value.as_str().into_owned());
-        let pending = message_id.as_ref().and_then(|message_id| {
+        let message_key = self
+            .parse_message_info(node.get())
+            .await
+            .ok()
+            .map(|info| info.inbound_message_key());
+        let pending = message_key.as_ref().and_then(|message_key| {
             self.pending_inbound_commits
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(message_id)
+                .get(message_key)
                 .cloned()
         });
+        let mut acknowledge_stanza = true;
         if let Some(pending) = pending {
-            pending.wait_committed().await;
-            if pending.send_delivery_receipt {
-                self.send_delivery_receipt(&pending.info).await;
+            match pending.wait_outcome().await {
+                InboundCommitOutcome::Committed => {
+                    if pending.send_delivery_receipt {
+                        self.send_delivery_receipt(&pending.info).await;
+                    }
+                }
+                InboundCommitOutcome::Abandoned => acknowledge_stanza = false,
             }
-            if let Some(message_id) = message_id {
+            if let Some(message_key) = message_key {
                 let mut commits = self
                     .pending_inbound_commits
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if commits
-                    .get(&message_id)
+                    .get(&message_key)
                     .is_some_and(|current| Arc::ptr_eq(current, &pending))
                 {
-                    commits.remove(&message_id);
+                    commits.remove(&message_key);
                 }
             }
         }
-        self.maybe_deferred_ack(node).await;
+        if acknowledge_stanza {
+            self.maybe_deferred_ack(node).await;
+        }
     }
 
     /// Deregister this companion device only when the server confirms the
@@ -1551,6 +1627,9 @@ impl Client {
         // is_connected==true with a cleared socket. send_node() independently
         // checks the socket, but this ordering avoids a confusing state window.
         self.is_connected.store(false, Ordering::Release);
+        // Wake commit-barrier workers without acknowledging unfinished
+        // messages. The server can redeliver them on the next connection.
+        self.abandon_inbound_messages();
         // Drop per-chat lanes so workers exit via channel close.
         self.chat_lanes.invalidate_all();
         // Clear pending retries so stale keys from detached scopeguard
@@ -4176,6 +4255,106 @@ mod tests {
     use crate::test_utils::MockHttpClient;
     use futures::channel::oneshot;
     use wacore_binary::SERVER_JID;
+
+    #[tokio::test]
+    async fn inbound_commit_barriers_scope_same_id_by_sender() {
+        let backend = crate::test_utils::create_test_backend().await;
+        let pm = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("persistence manager should initialize"),
+        );
+        let (client, _rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+        )
+        .await;
+        let chat: Jid = "120363021033254949@g.us"
+            .parse()
+            .expect("group JID should parse");
+        let first = Arc::new(wacore::types::message::MessageInfo {
+            source: wacore::types::message::MessageSource {
+                chat: chat.clone(),
+                sender: "5511111111111@s.whatsapp.net"
+                    .parse()
+                    .expect("first sender should parse"),
+                is_group: true,
+                ..Default::default()
+            },
+            id: "SAME_MSG_ID".to_owned(),
+            ..Default::default()
+        });
+        let second = Arc::new(wacore::types::message::MessageInfo {
+            source: wacore::types::message::MessageSource {
+                chat,
+                sender: "5522222222222@s.whatsapp.net"
+                    .parse()
+                    .expect("second sender should parse"),
+                is_group: true,
+                ..Default::default()
+            },
+            id: "SAME_MSG_ID".to_owned(),
+            ..Default::default()
+        });
+        let first_key = first.inbound_message_key();
+        let second_key = second.inbound_message_key();
+
+        client.register_inbound_commit(Arc::clone(&first), true);
+        client.register_inbound_commit(Arc::clone(&second), true);
+        let (first_commit, second_commit) = {
+            let pending = client
+                .pending_inbound_commits
+                .lock()
+                .expect("pending commit mutex should remain healthy");
+            assert_eq!(pending.len(), 2);
+            (
+                Arc::clone(
+                    pending
+                        .get(&first_key)
+                        .expect("first sender should have its own barrier"),
+                ),
+                Arc::clone(
+                    pending
+                        .get(&second_key)
+                        .expect("second sender should have its own barrier"),
+                ),
+            )
+        };
+
+        assert!(client.acknowledge_inbound_message(&first_key));
+        assert_eq!(
+            first_commit.wait_outcome().await,
+            InboundCommitOutcome::Committed
+        );
+        client.abandon_inbound_messages();
+        assert_eq!(
+            second_commit.wait_outcome().await,
+            InboundCommitOutcome::Abandoned
+        );
+        assert!(!client.acknowledge_inbound_message(&second_key));
+
+        client.register_inbound_commit(Arc::clone(&second), true);
+        let retried_commit = {
+            let pending = client
+                .pending_inbound_commits
+                .lock()
+                .expect("pending commit mutex should remain healthy");
+            Arc::clone(
+                pending
+                    .get(&second_key)
+                    .expect("redelivery should replace its abandoned barrier"),
+            )
+        };
+        assert!(!Arc::ptr_eq(&second_commit, &retried_commit));
+        assert!(client.acknowledge_inbound_message(&second_key));
+        assert_eq!(
+            retried_commit.wait_outcome().await,
+            InboundCommitOutcome::Committed
+        );
+    }
 
     #[tokio::test]
     async fn test_ack_behavior_for_incoming_stanzas() {

@@ -18,6 +18,35 @@ impl ChatMessageId {
     }
 }
 
+/// Identifies one inbound delivery across chats and senders.
+///
+/// WhatsApp message IDs are selected by the sending client and are not
+/// globally unique. The sender component is therefore required even when two
+/// messages share the same chat and raw ID.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct InboundMessageKey {
+    chat: Jid,
+    sender: Jid,
+    id: MessageId,
+}
+
+impl InboundMessageKey {
+    pub fn new(chat: Jid, sender: Jid, id: MessageId) -> Self {
+        Self { chat, sender, id }
+    }
+}
+
+impl std::fmt::Debug for InboundMessageKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InboundMessageKey")
+            .field("chat", &"[redacted]")
+            .field("sender", &"[redacted]")
+            .field("id", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Addressing mode for a group (phone number vs LID).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum AddressingMode {
@@ -146,6 +175,15 @@ pub struct MessageInfo {
 }
 
 impl MessageInfo {
+    /// Returns the source-scoped identity used by the durable commit barrier.
+    pub fn inbound_message_key(&self) -> InboundMessageKey {
+        InboundMessageKey::new(
+            self.source.chat.clone(),
+            self.source.sender.clone(),
+            self.id.clone(),
+        )
+    }
+
     /// WA Web: expired status messages (>24h) are silently dropped — no retry receipts,
     /// no undecryptable events. Matches `WAWebMsgProcessingDecryptionHandler.E()`.
     pub fn is_expired_status(&self) -> bool {
