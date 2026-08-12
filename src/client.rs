@@ -1368,21 +1368,22 @@ impl Client {
             .pending_inbound_commits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match pending.entry(info.inbound_message_key()) {
+        let commit = match pending.entry(info.inbound_message_key()) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 if entry.get().is_abandoned() {
-                    entry.insert(Arc::new(PendingInboundCommit::new(
-                        info,
-                        send_delivery_receipt,
-                    )));
+                    let commit = Arc::new(PendingInboundCommit::new(info, send_delivery_receipt));
+                    entry.insert(Arc::clone(&commit));
+                    commit
+                } else {
+                    Arc::clone(entry.get())
                 }
             }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(Arc::new(PendingInboundCommit::new(
-                    info,
-                    send_delivery_receipt,
-                )));
-            }
+            std::collections::hash_map::Entry::Vacant(entry) => Arc::clone(entry.insert(Arc::new(
+                PendingInboundCommit::new(info, send_delivery_receipt),
+            ))),
+        };
+        if !self.accepting_inbound_messages.load(Ordering::Acquire) {
+            commit.abandon();
         }
     }
 
@@ -4374,6 +4375,37 @@ mod tests {
                 .inbound_message_flush
                 .spawn(&*client.runtime, async {})
         );
+        let late = Arc::new(wacore::types::message::MessageInfo {
+            source: wacore::types::message::MessageSource {
+                chat: "5511111111111@s.whatsapp.net"
+                    .parse()
+                    .expect("direct chat should parse"),
+                sender: "5511111111111@s.whatsapp.net"
+                    .parse()
+                    .expect("direct sender should parse"),
+                ..Default::default()
+            },
+            id: "LATE_AFTER_QUIESCE".to_owned(),
+            ..Default::default()
+        });
+        let late_key = late.inbound_message_key();
+        client.register_inbound_commit(late, true);
+        let late_commit = {
+            let pending = client
+                .pending_inbound_commits
+                .lock()
+                .expect("pending commit mutex should remain healthy");
+            Arc::clone(
+                pending
+                    .get(&late_key)
+                    .expect("late barrier should remain visible to its worker"),
+            )
+        };
+        assert_eq!(
+            late_commit.wait_outcome().await,
+            InboundCommitOutcome::Abandoned
+        );
+        assert!(!client.acknowledge_inbound_message(&late_key));
 
         client.reopen_inbound_messages();
         assert!(client.accepting_inbound_messages.load(Ordering::Acquire));
