@@ -1263,6 +1263,7 @@ impl Client {
         self.is_connected.store(false, Ordering::Relaxed);
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.outbound_flush.reopen();
+        self.reopen_inbound_messages();
 
         // WA Web: both MQTT and DGW transports use a 20s connect timeout.
         // Without this, a dead network blocks on the OS TCP SYN timeout (~60-75s).
@@ -1425,6 +1426,12 @@ impl Client {
         self.inbound_message_flush.close();
         self.chat_lanes.invalidate_all();
         self.chat_lanes.run_pending_tasks().await;
+    }
+
+    fn reopen_inbound_messages(&self) {
+        self.inbound_message_flush.reopen();
+        self.accepting_inbound_messages
+            .store(true, Ordering::Release);
     }
 
     /// Waits until every message accepted before quiescence has either reached
@@ -4354,6 +4361,28 @@ mod tests {
             retried_commit.wait_outcome().await,
             InboundCommitOutcome::Committed
         );
+    }
+
+    #[tokio::test]
+    async fn inbound_quiesce_reopens_for_a_new_connection() {
+        let client = crate::test_utils::create_test_client().await;
+
+        client.begin_inbound_quiesce().await;
+        assert!(!client.accepting_inbound_messages.load(Ordering::Acquire));
+        assert!(
+            !client
+                .inbound_message_flush
+                .spawn(&*client.runtime, async {})
+        );
+
+        client.reopen_inbound_messages();
+        assert!(client.accepting_inbound_messages.load(Ordering::Acquire));
+        assert!(
+            client
+                .inbound_message_flush
+                .spawn(&*client.runtime, async {})
+        );
+        client.wait_for_inbound_quiescence().await;
     }
 
     #[tokio::test]
