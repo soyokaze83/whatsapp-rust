@@ -151,7 +151,33 @@ fn parse_database_path(database_url: &str) -> Result<String> {
 
 impl SqliteStore {
     pub async fn new(database_url: &str) -> std::result::Result<Self, StoreError> {
-        let manager = ConnectionManager::<SqliteConnection>::new(database_url);
+        Self::open(database_url, parse_database_path(database_url)?).await
+    }
+
+    /// Opens the database at the filesystem path `database_path` and refuses
+    /// it, like `SQLITE_OPEN_NOFOLLOW`, when the path passes through a
+    /// symbolic link. Every pooled connection and snapshot target is checked
+    /// the same way, so pass a path whose directories are already resolved.
+    #[cfg(unix)]
+    pub async fn new_nofollow(database_path: &str) -> std::result::Result<Self, StoreError> {
+        crate::nofollow::register()?;
+        let uri = crate::nofollow::database_uri(database_path);
+        // The pool retries a failed connection until its timeout, so a refused
+        // path is reported at once by a direct open first.
+        let probe = uri.clone();
+        tokio::task::spawn_blocking(move || SqliteConnection::establish(&probe).map(drop))
+            .await
+            .map_err(|e| StoreError::Database(Box::new(e)))?
+            .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        Self::open(&uri, database_path.to_string()).await
+    }
+
+    /// `database_path` is the plain filesystem path snapshots are written beside.
+    async fn open(
+        connection_url: &str,
+        database_path: String,
+    ) -> std::result::Result<Self, StoreError> {
+        let manager = ConnectionManager::<SqliteConnection>::new(connection_url);
 
         let pool_size = 2;
 
@@ -178,8 +204,6 @@ impl SqliteStore {
         })
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))??;
-
-        let database_path = parse_database_path(database_url)?;
 
         Ok(Self {
             pool,
@@ -2581,8 +2605,14 @@ impl DeviceStore for SqliteStore {
 
             // Save extra content if provided
             if let Some(data) = extra_data {
+                use std::io::Write as _;
                 let extra_path = format!("{}.json", target_path);
-                std::fs::write(&extra_path, data)?;
+                // create_new refuses an existing path, so a link there isn't followed.
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&extra_path)?
+                    .write_all(&data)?;
             }
 
             Ok(())
